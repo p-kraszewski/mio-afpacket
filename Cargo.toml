@@ -8,7 +8,7 @@ readme = "README.md"
 homepage = "https://github.com/p-kraszewski/mio-afpacket"
 repository = "https://github.com/p-kraszewski/mio-afpacket"
 keywords = ["mio", "async", "raw", "socket"]
-categories = ["network-programming", "os"]
+categories = ["network-programming", "os", "api-bindings"]
 edition = "2018"
 
 [dependencies]
