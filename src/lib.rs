@@ -1,38 +1,48 @@
-extern crate libc;
-extern crate mio;
+use std::{
+    io::{Error, ErrorKind, Read, Result, Write},
+    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
+};
 
-use mio::event::Evented;
-use mio::unix::EventedFd;
-use mio::{Poll, PollOpt, Ready, Token};
-use std::io::{Error, ErrorKind, Read, Result, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use libc::{
+    packet_mreq, setsockopt, sockaddr_ll, sockaddr_storage, socket, AF_PACKET, ETH_P_ALL,
+    PACKET_ADD_MEMBERSHIP, PACKET_DROP_MEMBERSHIP, PACKET_MR_PROMISC, SOCK_RAW, SOL_PACKET,
+};
+use mio::{event::Source, unix::SourceFd, Interest, Registry, Token};
 
-use libc::{sockaddr_ll, sockaddr_storage, socket, packet_mreq, setsockopt};
-use libc::{AF_PACKET, ETH_P_ALL, SOCK_RAW, SOL_PACKET, PACKET_MR_PROMISC,
-        PACKET_ADD_MEMBERSHIP, PACKET_DROP_MEMBERSHIP};
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Proto {
+    All,
+    Only(u16),
+}
 
 /// Packet sockets are used to receive or send raw packets at OSI 2 level.
 #[derive(Debug)]
-pub struct RawPacketStream(RawFd);
+pub struct RawPacketStream(RawFd, u16);
 
-impl Evented for RawPacketStream {
-    fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> Result<()> {
-        poll.register(&EventedFd(&self.0), token, interest, opts)
+impl Source for RawPacketStream {
+    fn register(&mut self, reg: &Registry, token: Token, interest: Interest) -> Result<()> {
+        reg.register(&mut SourceFd(&mut self.0), token, interest)
     }
 
-    fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> Result<()> {
-        poll.reregister(&EventedFd(&self.0), token, interest, opts)
+    fn reregister(&mut self, reg: &Registry, token: Token, interest: Interest) -> Result<()> {
+        reg.reregister(&mut SourceFd(&self.0), token, interest)
     }
 
-    fn deregister(&self, poll: &Poll) -> Result<()> {
-        poll.deregister(&EventedFd(&self.0))
+    fn deregister(&mut self, reg: &Registry) -> Result<()> {
+        reg.deregister(&mut SourceFd(&self.0))
     }
 }
 
 impl RawPacketStream {
-    /// Create new raw packet stream binding to all interfaces
-    pub fn new() -> Result<Self> {
-        let fd = unsafe { socket(AF_PACKET, SOCK_RAW, i32::from((ETH_P_ALL as u16).to_be())) };
+    /// Create new raw packet stream binding to all interfaces for a specific
+    /// protocol
+    pub fn new(proto: Proto) -> Result<Self> {
+        let raw_proto = match proto {
+            Proto::All => ETH_P_ALL as u16,
+            Proto::Only(p) => p,
+        };
+
+        let fd = unsafe { socket(AF_PACKET, SOCK_RAW, raw_proto.to_be() as i32) };
         if fd == -1 {
             return Err(Error::last_os_error());
         }
@@ -42,7 +52,7 @@ impl RawPacketStream {
         if res == -1 {
             return Err(Error::last_os_error());
         }
-        Ok(RawPacketStream(fd as RawFd))
+        Ok(RawPacketStream(fd as RawFd, raw_proto))
     }
 
     /// Bind socket to an interface (by name).
@@ -56,7 +66,7 @@ impl RawPacketStream {
             let mut ss: sockaddr_storage = std::mem::zeroed();
             let sll: *mut sockaddr_ll = &mut ss as *mut sockaddr_storage as *mut sockaddr_ll;
             (*sll).sll_family = AF_PACKET as u16;
-            (*sll).sll_protocol = (ETH_P_ALL as u16).to_be();
+            (*sll).sll_protocol = (self.1 as u16).to_be();
             (*sll).sll_ifindex = ifindex;
 
             let sa = (&ss as *const libc::sockaddr_storage) as *const libc::sockaddr;
@@ -83,7 +93,13 @@ impl RawPacketStream {
             mreq.mr_ifindex = idx;
             mreq.mr_type = PACKET_MR_PROMISC as u16;
 
-            setsockopt(self.0, SOL_PACKET, packet_membership, (&mreq as *const packet_mreq) as *const libc::c_void, std::mem::size_of::<packet_mreq>() as u32);
+            setsockopt(
+                self.0,
+                SOL_PACKET,
+                packet_membership,
+                (&mreq as *const packet_mreq) as *const libc::c_void,
+                std::mem::size_of::<packet_mreq>() as u32,
+            );
         }
 
         Ok(())
@@ -95,7 +111,7 @@ fn index_by_name(name: &str) -> Result<i32> {
         return Err(ErrorKind::InvalidInput.into());
     }
     let mut buf = [0u8; libc::IFNAMSIZ];
-        buf[..name.len()].copy_from_slice(name.as_bytes());
+    buf[..name.len()].copy_from_slice(name.as_bytes());
     let idx = unsafe { libc::if_nametoindex(buf.as_ptr() as *const libc::c_char) };
     if idx == 0 {
         return Err(Error::last_os_error());
@@ -168,7 +184,7 @@ impl AsRawFd for RawPacketStream {
 
 impl FromRawFd for RawPacketStream {
     unsafe fn from_raw_fd(fd: RawFd) -> RawPacketStream {
-        RawPacketStream(fd)
+        RawPacketStream(fd, ETH_P_ALL as u16)
     }
 }
 
@@ -176,26 +192,31 @@ impl FromRawFd for RawPacketStream {
 // tests must be executed sequentially
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::io::{Read, Write};
-    use super::RawPacketStream;
+    use std::time::Duration;
+    use std::{
+        collections::HashMap,
+        io::{Read, Write},
+    };
+
+    use pretty_hex::*;
+
+    use super::{Proto, RawPacketStream};
 
     const MESSAGE: &[u8] = b"hello world\n";
 
     #[test]
     fn it_works() {
-        RawPacketStream::new().unwrap();
+        RawPacketStream::new(Proto::All).unwrap();
     }
 
     #[test]
     fn promisc_mode() {
-        let mut rp = RawPacketStream::new().unwrap();
+        let mut rp = RawPacketStream::new(Proto::All).unwrap();
         rp.set_promisc("lo", true).unwrap();
     }
 
     fn execute_test(test: impl Test) {
-        use mio::net::*;
-        use mio::*;
+        use mio::{net::*, *};
 
         const TCP_SERVER: Token = Token(0);
         const TCP_CLIENT: Token = Token(1);
@@ -205,39 +226,41 @@ mod tests {
 
         let mut id = CONNECTION_ID_START;
 
-        let poll = Poll::new().unwrap();
+        let mut poll = Poll::new().unwrap();
         let mut events = Events::with_capacity(1024);
         let mut connections = HashMap::new();
 
-        let tcp_server = TcpListener::bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let sa = "127.0.0.1:0".parse().unwrap();
+        let mut tcp_server = TcpListener::bind(sa).unwrap();
         let server_addr = tcp_server.local_addr().unwrap();
 
-        poll.register(&tcp_server, TCP_SERVER, Ready::readable(), PollOpt::edge())
+        poll.registry()
+            .register(&mut tcp_server, TCP_SERVER, Interest::READABLE)
             .unwrap();
 
-        let tcp_client = TcpStream::connect(&server_addr).unwrap();
-        poll.register(&tcp_client, TCP_CLIENT, Ready::readable(), PollOpt::edge())
+        let mut tcp_client = TcpStream::connect(server_addr).unwrap();
+        poll.registry()
+            .register(&mut tcp_client, TCP_CLIENT, Interest::READABLE)
             .unwrap();
 
-        let mut raw = RawPacketStream::new().unwrap();
+        let mut raw = RawPacketStream::new(Proto::All).unwrap();
         test.setup(&mut raw);
-        poll.register(
-            &raw,
-            RAW,
-            Ready::readable() | Ready::writable(),
-            PollOpt::edge(),
-        ).unwrap();
+        poll.registry()
+            .register(&mut raw, RAW, Interest::READABLE | Interest::WRITABLE)
+            .unwrap();
 
         loop {
-            poll.poll(&mut events, None).unwrap();
+            poll.poll(&mut events, Some(Duration::from_secs(10)))
+                .unwrap();
 
             for event in &events {
                 match event.token() {
                     TCP_SERVER => {
                         println!("accepting conn");
-                        let (conn, _) = tcp_server.accept().unwrap();
+                        let (mut conn, _) = tcp_server.accept().unwrap();
                         let token = Token(id);
-                        poll.register(&conn, token, Ready::writable(), PollOpt::edge())
+                        poll.registry()
+                            .register(&mut conn, token, Interest::WRITABLE)
                             .unwrap();
                         connections.insert(token, conn);
                         id += 1;
@@ -246,12 +269,12 @@ mod tests {
                         println!("connected");
                     }
                     RAW => {
-                        if event.readiness().is_readable() {
+                        if event.is_readable() {
                             if test.read(&mut raw) {
                                 return;
                             }
                         }
-                        if event.readiness().is_writable() {
+                        if event.is_writable() {
                             test.write(&mut raw);
                         }
                     }
@@ -318,7 +341,7 @@ mod tests {
             }
         };
 
-        impl Test {}
+        impl dyn Test {}
         execute_test(Basic)
     }
 
@@ -329,6 +352,7 @@ mod tests {
             fn setup(&self, raw: &mut RawPacketStream) {
                 raw.bind("lo").unwrap();
             }
+
             fn read(&self, raw: &mut RawPacketStream) -> bool {
                 read_hello_world(raw)
             }
@@ -345,16 +369,20 @@ mod tests {
             fn setup(&self, raw: &mut RawPacketStream) {
                 raw.bind("lo").unwrap();
             }
+
             fn read(&self, raw: &mut RawPacketStream) -> bool {
                 let mut buf = [0; 1024];
                 if let Ok(len) = raw.read(&mut buf) {
-                    println!("pkt: {:02x?}", &buf[..len]);
+                    let sbuf = &buf[..len];
+                    println!("{:?}", sbuf.hex_dump());
+                    // println!("pkt: {:02x?}", &buf[.. len]);
                     if &buf[6..12] == SRC_MAC {
                         return true;
                     }
                 }
                 false
             }
+
             fn write(&self, raw: &mut RawPacketStream) {
                 let mut buf = vec![0; 32];
                 buf[6..12].clone_from_slice(SRC_MAC);

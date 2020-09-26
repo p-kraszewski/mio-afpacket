@@ -1,16 +1,19 @@
 [package]
-name = "mio-afpacket"
-version = "0.1.2"
-authors = ["Alexander Polakov <plhk@sdf.org>"]
+name = "pakr-mio-afpacket"
+version = "0.2.0"
+authors = ["Alexander Polakov <plhk@sdf.org>", "Pawel Kraszewski <pawel@kraszewscy.net>"]
 description = "Raw packet sockets (AF_PACKET) support for mio"
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/polachok/mio-afpacket"
-repository = "https://github.com/polachok/mio-afpacket"
+homepage = "https://github.com/p-kraszewski/mio-afpacket"
+repository = "https://github.com/p-kraszewski/mio-afpacket"
 keywords = ["mio", "async", "raw", "socket"]
-categories = ["network-programming","os"]
+categories = ["network-programming", "os"]
 edition = "2018"
 
 [dependencies]
-mio = "0.6"
-libc = { git = "https://github.com/rust-lang/libc", branch = "master" }
+mio = { version = "^0.7", features = ["tcp", "os-util", "os-poll"] }
+libc = "^0.2"
+
+[dev-dependencies]
+pretty-hex = "^0.2"
